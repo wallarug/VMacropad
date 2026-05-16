@@ -1,7 +1,7 @@
 import customtkinter as ctk
 import tkinter as tk
 import tkinter.ttk as ttk
-from tkinter import messagebox, colorchooser
+from tkinter import messagebox, colorchooser, filedialog
 import hid
 import json
 import os
@@ -536,6 +536,12 @@ class VMacroApp(ctk.CTk):
         
         self.btn_del = ctk.CTkButton(btn_frame, text="DELETE", font=Theme.FONT_BODY, fg_color="#441111", hover_color="#802122", command=self.del_preset)
         self.btn_del.grid(row=0, column=1, padx=5, sticky="ew")
+
+        self.btn_import = ctk.CTkButton(btn_frame, text="IMPORT", font=Theme.FONT_BODY, fg_color=Theme.BUTTON_HOVER, hover_color=Theme.TEXT_DISABLED, command=self.import_preset_file)
+        self.btn_import.grid(row=1, column=0, padx=5, pady=(8,0), sticky="ew")
+
+        self.btn_export = ctk.CTkButton(btn_frame, text="EXPORT", font=Theme.FONT_BODY, fg_color=Theme.BUTTON_HOVER, hover_color=Theme.TEXT_DISABLED, command=self.export_preset_file)
+        self.btn_export.grid(row=1, column=1, padx=5, pady=(8,0), sticky="ew")
 
         self.btn_settings = ctk.CTkButton(self.sidebar, text="SETTINGS", font=Theme.FONT_BODY, fg_color="transparent", border_width=1, border_color=Theme.TEXT_DISABLED, command=self.open_settings_ui)
         self.btn_settings.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 20))
@@ -1241,6 +1247,175 @@ class VMacroApp(ctk.CTk):
             if self.presets:
                 self.load_preset_by_name(list(self.presets.keys())[0])
 
+    # --- Bulk import / export -------------------------------------------------
+    # Friendly preset file schema (JSON):
+    #   {
+    #     "name": "ETC EOS",
+    #     "color": "#2244aa",
+    #     "led": 0,
+    #     "controls": {
+    #       "button1":   {"key": "F1"},
+    #       "button2":   {"ctrl": true, "key": "Z"},
+    #       "button3":   {"media": "Vol Up"},
+    #       "button4":   {"mouse": "Left Click"},
+    #       "knob1_ccw": {"key": "Page Down"},
+    #       "knob1_cw":  {"key": "Page Up"},
+    #       "knob1_press": {"key": "Enter"}
+    #     }
+    #   }
+    # Control names: button1..button16 and knob{1..3}_{ccw|cw|press}.
+    # A spec may carry ctrl/shift/alt/win booleans plus one of key / media /
+    # mouse (+ optional scroll). Omitted controls default to unmapped.
+
+    def _control_name_to_index(self, raw):
+        n = str(raw).strip().lower().replace(" ", "").replace("-", "_")
+        if n.startswith("button"):
+            try:
+                b = int(n[6:])
+            except ValueError:
+                return None
+            if 1 <= b <= NUM_BUTTONS:
+                return b - 1
+            return None
+        m = re.match(r"knob([1-9]\d*)_(ccw|cw|press)", n)
+        if m:
+            k = int(m.group(1))
+            if 1 <= k <= NUM_KNOBS:
+                off = {"ccw": 0, "cw": 1, "press": 2}[m.group(2)]
+                return NUM_BUTTONS + (k - 1) * 3 + off
+        return None
+
+    def _index_to_control_name(self, idx):
+        if idx < NUM_BUTTONS:
+            return f"button{idx + 1}"
+        rel = idx - NUM_BUTTONS
+        k = rel // 3 + 1
+        part = ["ccw", "cw", "press"][rel % 3]
+        return f"knob{k}_{part}"
+
+    def _spec_to_control(self, spec):
+        spec = spec or {}
+        mod = (1 if spec.get("ctrl") else 0) | (2 if spec.get("shift") else 0) \
+            | (4 if spec.get("alt") else 0) | (8 if spec.get("win") else 0)
+
+        if "media" in spec and spec["media"]:
+            ci = {k.lower(): k for k in MEDIA_MAP}
+            b1, b2 = MEDIA_MAP.get(ci.get(str(spec["media"]).lower(), "None"), (0, 0))
+            return {"type": "media", "b1": b1, "b2": b2}
+
+        mb_name = spec.get("mouse")
+        sc_name = spec.get("scroll")
+        if (mb_name and str(mb_name).lower() != "none") or (sc_name and str(sc_name).lower() != "none"):
+            mbi = {k.lower(): k for k in MOUSE_BUTTONS}
+            sci = {k.lower(): k for k in MOUSE_WHEEL}
+            btn = MOUSE_BUTTONS.get(mbi.get(str(mb_name).lower(), "None"), 0)
+            scr = MOUSE_WHEEL.get(sci.get(str(sc_name).lower(), "None"), 0)
+            return {"type": "mouse", "mod": mod, "code": 0, "mouse_btn": btn, "mouse_scroll": scr}
+
+        ki = {k.lower(): k for k in KEY_MAP}
+        code = KEY_MAP.get(ki.get(str(spec.get("key", "None")).lower(), "None"), 0)
+        return {"type": "key", "mod": mod, "code": code, "mouse_btn": 0, "mouse_scroll": 0}
+
+    def _control_to_spec(self, d):
+        t = d.get("type", "key")
+        if t == "media":
+            name = next((k for k, v in MEDIA_MAP.items() if v == (d.get("b1", 0), d.get("b2", 0))), "None")
+            return None if name == "None" else {"media": name}
+
+        mod = d.get("mod", 0)
+        mods = {}
+        if mod & 1: mods["ctrl"] = True
+        if mod & 2: mods["shift"] = True
+        if mod & 4: mods["alt"] = True
+        if mod & 8: mods["win"] = True
+
+        if t == "mouse":
+            spec = dict(mods)
+            btn = next((k for k, v in MOUSE_BUTTONS.items() if v == d.get("mouse_btn", 0)), "None")
+            scr = next((k for k, v in MOUSE_WHEEL.items() if v == d.get("mouse_scroll", 0)), "None")
+            if btn != "None": spec["mouse"] = btn
+            if scr != "None": spec["scroll"] = scr
+            return spec or None
+
+        key = next((k for k, v in KEY_MAP.items() if v == d.get("code", 0)), "None")
+        if key == "None" and not mods:
+            return None
+        spec = dict(mods)
+        if key != "None": spec["key"] = key
+        return spec or None
+
+    def import_preset_file(self):
+        path = filedialog.askopenfilename(title="Import Preset", filetypes=[("Preset JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Import Failed", f"Could not read file:\n{e}")
+            return
+        if not isinstance(data, dict) or "controls" not in data:
+            messagebox.showerror("Import Failed", "File is not a valid preset (missing 'controls').")
+            return
+
+        keys = [{"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0} for _ in range(NUM_CONTROLS)]
+        mapped, unknown = 0, []
+        for cname, spec in data.get("controls", {}).items():
+            idx = self._control_name_to_index(cname)
+            if idx is None:
+                unknown.append(str(cname))
+                continue
+            keys[idx] = self._spec_to_control(spec)
+            mapped += 1
+
+        name = str(data.get("name") or os.path.splitext(os.path.basename(path))[0]).strip() or "Imported"
+        if name in self.presets and not messagebox.askyesno("Overwrite?", f"Preset '{name}' already exists. Overwrite it?"):
+            return
+
+        try:
+            led = int(data.get("led", 0))
+        except (TypeError, ValueError):
+            led = 0
+        self.presets[name] = {"keys": keys, "led": led, "color": data.get("color", "#888888")}
+        self.save_presets_file()
+        self.refresh_preset_list()
+        self.load_preset_by_name(name)
+
+        msg = f"Imported '{name}' — {mapped} control(s) mapped."
+        if unknown:
+            msg += f"\nIgnored unknown control name(s): {', '.join(unknown[:8])}"
+            if len(unknown) > 8:
+                msg += f" (+{len(unknown) - 8} more)"
+        messagebox.showinfo("Import Complete", msg)
+
+    def export_preset_file(self):
+        if not self.current_preset_name or self.current_preset_name not in self.presets:
+            messagebox.showerror("Export Failed", "No preset selected to export.")
+            return
+        path = filedialog.asksaveasfilename(title="Export Preset", defaultextension=".json",
+                                            initialfile=f"{self.current_preset_name}.json",
+                                            filetypes=[("Preset JSON", "*.json")])
+        if not path:
+            return
+        controls = {}
+        for i, d in enumerate(self.current_data):
+            spec = self._control_to_spec(d)
+            if spec is not None:
+                controls[self._index_to_control_name(i)] = spec
+        out = {
+            "name": self.current_preset_name,
+            "color": self.presets[self.current_preset_name].get("color", "#888888"),
+            "led": self.led_mode,
+            "controls": controls,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=4)
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+            return
+        messagebox.showinfo("Export Complete", f"Exported '{self.current_preset_name}' to:\n{path}")
+
     def start_upload(self):
         if self.is_uploading: return
         if self.pad.is_connected():
@@ -1285,6 +1460,8 @@ class VMacroApp(ctk.CTk):
             self.btn_upload.configure(state=s, text="UPLOADING..." if b else "UPLOAD CONFIGURATION")
             self.btn_add.configure(state=s)
             self.btn_del.configure(state=s)
+            self.btn_import.configure(state=s)
+            self.btn_export.configure(state=s)
             for btn in self.preset_widgets.values(): btn.configure(state=s)
         except: pass
 
