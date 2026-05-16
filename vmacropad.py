@@ -340,7 +340,7 @@ class VMacroApp(ctk.CTk):
         self.cfg_notify_preset = False
         self.cfg_notify_status = False
         self.cfg_tray_enabled = True
-        self.cfg_startup = True
+        self.cfg_startup = False
         
         if os.path.exists(CONFIG_FILE):
             try:
@@ -352,7 +352,7 @@ class VMacroApp(ctk.CTk):
                     self.cfg_notify_preset = conf.get("notify_preset", False)
                     self.cfg_notify_status = conf.get("notify_status", False)
                     self.cfg_tray_enabled = conf.get("tray_enabled", True)
-                    self.cfg_startup = conf.get("startup_enabled", True)
+                    self.cfg_startup = conf.get("startup_enabled", False)
             except: pass
 
     def load_config_state_ui_vars(self):
