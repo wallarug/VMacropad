@@ -341,6 +341,7 @@ class VMacroApp(ctk.CTk):
         self.cfg_notify_status = False
         self.cfg_tray_enabled = True
         self.cfg_startup = False
+        self.cfg_has_leds = False
         
         if os.path.exists(CONFIG_FILE):
             try:
@@ -353,6 +354,7 @@ class VMacroApp(ctk.CTk):
                     self.cfg_notify_status = conf.get("notify_status", False)
                     self.cfg_tray_enabled = conf.get("tray_enabled", True)
                     self.cfg_startup = conf.get("startup_enabled", False)
+                    self.cfg_has_leds = conf.get("has_leds", False)
             except: pass
 
     def load_config_state_ui_vars(self):
@@ -379,7 +381,8 @@ class VMacroApp(ctk.CTk):
                     "notify_preset": self.cfg_notify_preset,
                     "notify_status": self.cfg_notify_status,
                     "tray_enabled": self.cfg_tray_enabled,
-                    "startup_enabled": self.cfg_startup
+                    "startup_enabled": self.cfg_startup,
+                    "has_leds": self.cfg_has_leds
                 }, f, indent=4)
         except: pass
 
@@ -565,6 +568,7 @@ class VMacroApp(ctk.CTk):
         var_notif_s = ctk.BooleanVar(value=self.cfg_notify_status)
         var_tray = ctk.BooleanVar(value=self.cfg_tray_enabled)
         var_start = ctk.BooleanVar(value=self.cfg_startup)
+        var_leds = ctk.BooleanVar(value=self.cfg_has_leds)
         
         frm_hw = ctk.CTkFrame(win, fg_color="transparent")
         frm_hw.pack(pady=10, padx=40, fill="x")
@@ -589,6 +593,7 @@ class VMacroApp(ctk.CTk):
                     if self.tray_icon: self.tray_icon.stop()
                     self.tray_icon = None
             self.cfg_startup = var_start.get()
+            self.cfg_has_leds = var_leds.get()
             self.toggle_startup()
             try:
                 new_vid = int(entry_vid.get(), 16)
@@ -610,6 +615,7 @@ class VMacroApp(ctk.CTk):
         ctk.CTkCheckBox(win, text="Notify on Connect/Disconnect", variable=var_notif_s).pack(pady=10, padx=40, anchor="w")
         ctk.CTkCheckBox(win, text="Enable System Tray Icon", variable=var_tray).pack(pady=10, padx=40, anchor="w")
         ctk.CTkCheckBox(win, text="Start with Windows", variable=var_start).pack(pady=10, padx=40, anchor="w")
+        ctk.CTkCheckBox(win, text="Device has LEDs", variable=var_leds).pack(pady=10, padx=40, anchor="w")
         
         ctk.CTkButton(win, text="SAVE & CLOSE", command=save_and_close, fg_color=Theme.ACTIVE_BUTTON, text_color="black").pack(pady=25)
         
@@ -1255,7 +1261,8 @@ class VMacroApp(ctk.CTk):
                     elif t == "mouse": 
                         self.pad.set_mouse(i, d.get("mouse_btn", 0), d.get("mouse_scroll", 0), d.get("mod", 0))
                     time.sleep(0.02)
-                self.pad.set_led(self.led_mode)
+                if self.cfg_has_leds:
+                    self.pad.set_led(self.led_mode)
                 self.pad.save_to_flash()
             except Exception as e:
                 print(f"Upload Error: {e}")
