@@ -257,6 +257,40 @@ class MacroPadDevice:
 
     def set_led(self, mode): return self.write_data([0xB0, 0x08, mode])
 
+    # --- Diagnostics: raw writes with real return values ----------------------
+    def write_data_diag(self, payload, strategy="auto"):
+        """Send one report; return (ok, detail). Unlike write_data this does
+        not swallow the hidapi return code, so callers can see what happened."""
+        if not self.device:
+            return False, "no device connected"
+        buf = [REPORT_ID] + payload + [0] * (64 - len(payload))
+        if strategy == "output":
+            order = ["output"]
+        elif strategy == "feature":
+            order = ["feature"]
+        else:
+            order = ["output", "feature"]
+        notes = []
+        for mode in order:
+            try:
+                if mode == "output":
+                    res = self.device.write(buf)
+                else:
+                    res = self.device.send_feature_report(buf)
+                notes.append(f"{mode}={res}")
+                if res is not None and res >= 0:
+                    self.working_strategy = mode
+                    return True, f"OK via {mode} (bytes={res})"
+            except Exception as e:
+                notes.append(f"{mode}!ERR:{e}")
+        return False, "; ".join(notes)
+
+    def set_key_raw(self, action_id, mod, code, strategy="auto"):
+        """set_key against an explicit firmware action id (bypasses ACTION_IDS)."""
+        ok1, d1 = self.write_data_diag([action_id, 1, 1, 0, 0, 0], strategy)
+        ok2, d2 = self.write_data_diag([action_id, 1, 1, 1, mod, code], strategy)
+        return (ok1 and ok2), f"hdr[{d1}] data[{d2}]"
+
 
 # --- MAIN APPLICATION ---
 class VMacroApp(ctk.CTk):
@@ -543,10 +577,140 @@ class VMacroApp(ctk.CTk):
         self.btn_export = ctk.CTkButton(btn_frame, text="EXPORT", font=Theme.FONT_BODY, fg_color=Theme.BUTTON_HOVER, hover_color=Theme.TEXT_DISABLED, command=self.export_preset_file)
         self.btn_export.grid(row=1, column=1, padx=5, pady=(8,0), sticky="ew")
 
+        self.btn_diag = ctk.CTkButton(btn_frame, text="DIAGNOSTICS", font=Theme.FONT_BODY, fg_color="#1c2c44", hover_color="#27406b", command=self.open_diag_ui)
+        self.btn_diag.grid(row=2, column=0, columnspan=2, padx=5, pady=(8,0), sticky="ew")
+
         self.btn_settings = ctk.CTkButton(self.sidebar, text="SETTINGS", font=Theme.FONT_BODY, fg_color="transparent", border_width=1, border_color=Theme.TEXT_DISABLED, command=self.open_settings_ui)
         self.btn_settings.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 20))
         
         self.refresh_preset_list()
+
+    def _sweep_legend(self, start, end):
+        # Maps each firmware action id to a distinct, printable key:
+        #   ids 1..26 -> A..Z, ids 27..36 -> 1..9,0
+        legend = {}
+        for aid in range(start, end + 1):
+            if 1 <= aid <= 26:
+                name = chr(ord('A') + aid - 1)
+            elif 27 <= aid <= 36:
+                digit = aid - 26
+                name = "0" if digit == 10 else str(digit)
+            else:
+                continue
+            legend[aid] = (name, KEY_MAP.get(name, 0))
+        return legend
+
+    def open_diag_ui(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Diagnostics - Action ID Calibration")
+        win.geometry("640x640")
+        win.attributes("-topmost", True)
+        win.configure(fg_color=Theme.CONTAINER_BG)
+        try:
+            win.iconbitmap(self.resource_path("vmacropad.ico"))
+        except: pass
+
+        ctk.CTkLabel(win, text="DEVICE DIAGNOSTICS", font=Theme.FONT_HEADER).pack(pady=(15, 2))
+        ctk.CTkLabel(win, text="Reverse-engineer which firmware action ID drives which physical control.",
+                     text_color=Theme.TEXT_SECONDARY, font=("Segoe UI", 11)).pack()
+        ctk.CTkLabel(win, text="This OVERWRITES the device mapping. Re-upload a preset afterwards to restore.",
+                     text_color="#ffb74d", font=("Segoe UI", 11, "bold")).pack(pady=(2, 8))
+
+        ctrl = ctk.CTkFrame(win, fg_color="transparent")
+        ctrl.pack(fill="x", padx=20)
+        ctk.CTkLabel(ctrl, text="Write strategy:", text_color=Theme.TEXT_SECONDARY).grid(row=0, column=0, sticky="w", pady=4)
+        strat = ctk.CTkOptionMenu(ctrl, values=["auto", "output", "feature"], width=110)
+        strat.set("auto")
+        strat.grid(row=0, column=1, padx=8)
+        ctk.CTkLabel(ctrl, text="Action ID range:", text_color=Theme.TEXT_SECONDARY).grid(row=0, column=2, sticky="w", padx=(15, 0))
+        e_start = ctk.CTkEntry(ctrl, width=55); e_start.insert(0, "1")
+        e_start.grid(row=0, column=3, padx=4)
+        ctk.CTkLabel(ctrl, text="to").grid(row=0, column=4)
+        e_end = ctk.CTkEntry(ctrl, width=55); e_end.insert(0, "32")
+        e_end.grid(row=0, column=5, padx=4)
+
+        log_box = ctk.CTkTextbox(win, fg_color=Theme.MAIN_BG, font=("Consolas", 11), wrap="word")
+        log_box.pack(fill="both", expand=True, padx=20, pady=12)
+
+        def log(msg):
+            def _a():
+                if win.winfo_exists():
+                    log_box.insert("end", msg + "\n")
+                    log_box.see("end")
+            self.after(0, _a)
+
+        def run_sweep():
+            if not self.pad.is_connected():
+                log("ERROR: device not connected.")
+                return
+            try:
+                s = max(1, int(e_start.get())); en = min(60, int(e_end.get()))
+            except ValueError:
+                log("ERROR: range must be integers.")
+                return
+            strategy = strat.get()
+            legend = self._sweep_legend(s, en)
+
+            def worker():
+                with self.upload_lock:
+                    log(f"--- SWEEP ids {s}..{en}, strategy={strategy} ---")
+                    ok, d = self.pad.write_data_diag([0xA1, 0], strategy)
+                    log(f"select_layer(0): {d}")
+                    for aid in range(s, en + 1):
+                        if aid not in legend:
+                            continue
+                        name, code = legend[aid]
+                        ok, detail = self.pad.set_key_raw(aid, 0, code, strategy)
+                        log(f"  action {aid:>2} -> '{name}'   {'OK' if ok else 'FAIL'}  {detail}")
+                        time.sleep(0.02)
+                    ok, d = self.pad.write_data_diag([0xAA, 0xAA], strategy)
+                    log(f"save_to_flash: {d}")
+                    log("--- SWEEP DONE ---")
+                    log("Now open Notepad and press each physical button / turn+press")
+                    log("each knob. Note the letter produced, then map it back via")
+                    log("this legend:")
+                    log("  " + "  ".join(f"{a}='{n}'" for a, (n, _) in legend.items()))
+                    log("Tell Claude the 'physical control -> letter' list.")
+            threading.Thread(target=worker, daemon=True).start()
+
+        def single_write():
+            if not self.pad.is_connected():
+                log("ERROR: device not connected.")
+                return
+            try:
+                aid = int(e_single_id.get())
+            except ValueError:
+                log("ERROR: action id must be an integer.")
+                return
+            kname = cb_single_key.get()
+            code = KEY_MAP.get(kname, 0)
+            strategy = strat.get()
+
+            def worker():
+                with self.upload_lock:
+                    self.pad.write_data_diag([0xA1, 0], strategy)
+                    ok, detail = self.pad.set_key_raw(aid, 0, code, strategy)
+                    self.pad.write_data_diag([0xAA, 0xAA], strategy)
+                    log(f"single: action {aid} -> '{kname}'  {'OK' if ok else 'FAIL'}  {detail}")
+            threading.Thread(target=worker, daemon=True).start()
+
+        row2 = ctk.CTkFrame(win, fg_color="transparent")
+        row2.pack(fill="x", padx=20, pady=(0, 6))
+        ctk.CTkButton(row2, text="RUN CALIBRATION SWEEP", fg_color=Theme.ACTIVE_BUTTON,
+                      text_color="black", command=run_sweep).pack(side="left")
+        ctk.CTkLabel(row2, text="  Single write:", text_color=Theme.TEXT_SECONDARY).pack(side="left", padx=(15, 4))
+        e_single_id = ctk.CTkEntry(row2, width=55, placeholder_text="id"); e_single_id.pack(side="left", padx=4)
+        single_keys = [c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] + [str(d) for d in range(10)]
+        cb_single_key = ctk.CTkComboBox(row2, values=single_keys, state="readonly", width=70)
+        cb_single_key.set("Z")
+        cb_single_key.pack(side="left", padx=4)
+        ctk.CTkButton(row2, text="Send", width=60, command=single_write).pack(side="left", padx=4)
+
+        log("Ready. 'Run Calibration Sweep' assigns a unique letter to every")
+        log("action id, so one Notepad pass reveals the whole device map.")
+        log("If EVERY write says FAIL -> the report format/strategy is wrong")
+        log("(try output vs feature). If writes say OK but the pad types")
+        log("nothing -> firmware ignores this packet shape entirely.")
 
     def open_settings_ui(self):
         win = ctk.CTkToplevel(self)
@@ -1462,6 +1626,7 @@ class VMacroApp(ctk.CTk):
             self.btn_del.configure(state=s)
             self.btn_import.configure(state=s)
             self.btn_export.configure(state=s)
+            self.btn_diag.configure(state=s)
             for btn in self.preset_widgets.values(): btn.configure(state=s)
         except: pass
 
