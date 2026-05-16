@@ -71,7 +71,27 @@ class Theme:
 DEFAULT_VENDOR_ID = 0x1189
 DEFAULT_PRODUCT_ID = 0x8890
 REPORT_ID = 0x03
-ACTION_IDS =[1, 2, 3, 13, 15, 14]
+
+# Physical layout of the 16-button / 3-knob macropad (VID 0x1189 / PID 0x8890).
+# 16 push buttons + 3 rotary encoders, each encoder contributing CCW / CW / press.
+NUM_BUTTONS = 16
+NUM_KNOBS = 3
+NUM_CONTROLS = NUM_BUTTONS + (NUM_KNOBS * 3)  # 25 mappable actions per layer
+
+# Firmware action ID for each UI control, in the same order as current_data:
+#   indices 0..15            -> buttons 1..16
+#   per knob k (base 16+k*3) -> [CCW, CW, Press]
+# The small 3-key/1-knob variant of this firmware family used [1,2,3, 13,15,14]
+# (keys from 1, then a consecutive CCW/Press/CW knob block). We generalise that:
+# buttons stay sequential from 1 and each knob occupies a consecutive triple
+# after the 16 button slots. The OUT config protocol for this larger device is
+# not captured/confirmed, so these IDs are a best-effort assumption and may need
+# adjustment once a USBPcap capture of the vendor tool decodes the real protocol.
+ACTION_IDS = list(range(1, NUM_BUTTONS + 1)) + [
+    17, 19, 18,   # Knob 1: CCW, CW, Press
+    20, 22, 21,   # Knob 2: CCW, CW, Press
+    23, 25, 24,   # Knob 3: CCW, CW, Press
+]
 
 # --- KEY MAPPINGS ---
 KEY_MAP = {
@@ -248,10 +268,10 @@ class VMacroApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
         self.title(f"V Macropad Manager")
-        self.geometry("1000x700")
+        self.geometry("1080x860")
         self.configure(fg_color=Theme.MAIN_BG)
         self.protocol("WM_DELETE_WINDOW", self.on_close_attempt)
-        self.minsize(950, 650)
+        self.minsize(1000, 800)
         
         try:
             icon_path = self.resource_path("vmacropad.ico")
@@ -263,7 +283,7 @@ class VMacroApp(ctk.CTk):
         self.presets = self.load_presets()
         self.app_mappings = self.load_mappings()
         
-        self.current_data =[{"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0} for _ in range(6)]
+        self.current_data =[{"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0} for _ in range(NUM_CONTROLS)]
         self.led_mode = 1
         self.selected_key_index = 0
         self.current_preset_name = None
@@ -630,7 +650,7 @@ class VMacroApp(ctk.CTk):
         self.vis_container = ctk.CTkFrame(self.main_frame, fg_color=Theme.WIDGET_BG, corner_radius=15)
         self.vis_container.grid(row=1, column=0, sticky="nsew", pady=10)
         
-        self.canvas = tk.Canvas(self.vis_container, bg=Theme.WIDGET_BG, highlightthickness=0, height=250)
+        self.canvas = tk.Canvas(self.vis_container, bg=Theme.WIDGET_BG, highlightthickness=0, height=360)
         self.canvas.pack(fill="both", expand=True, padx=20, pady=20)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Configure>", lambda e: self.draw_visualizer())
@@ -953,7 +973,14 @@ class VMacroApp(ctk.CTk):
                 if "scroll" in new_d: new_d["mouse_scroll"] = new_d["scroll"]
 
             cleaned_data.append(new_d)
-            
+
+        # Normalise to the current control count so presets saved by older
+        # builds (6 controls) still load on the 25-control layout. Extra slots
+        # default to an unmapped key; surplus slots are dropped.
+        while len(cleaned_data) < NUM_CONTROLS:
+            cleaned_data.append({"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0})
+        cleaned_data = cleaned_data[:NUM_CONTROLS]
+
         self.current_data = cleaned_data
         self.led_mode = data.get("led", 1)
         
@@ -993,51 +1020,77 @@ class VMacroApp(ctk.CTk):
         points =[x1+radius, y1, x1+radius, y1, x2-radius, y1, x2-radius, y1, x2, y1, x2, y1+radius, x2, y1+radius, x2, y2-radius, x2, y2-radius, x2, y2, x2-radius, y2, x2-radius, y2, x1+radius, y2, x1+radius, y2, x1, y2, x1, y2-radius, x1, y2-radius, x1, y1+radius, x1, y1+radius, x1, y1]
         return self.canvas.create_polygon(points, **kwargs, smooth=True)
 
+    def _get_layout(self):
+        # Single source of truth for control geometry, shared by the renderer
+        # and the click handler. Returns (buttons, knobs):
+        #   buttons -> list of (x1, y1, x2, y2) for control indices 0..NUM_BUTTONS-1
+        #   knobs   -> list of (cx, cy, r); knob k owns control indices
+        #              NUM_BUTTONS + k*3 .. +2  (CCW, CW, Press)
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        btn = 64
+        gap = 14
+        cols, rows = 4, 4
+        grid_w = cols * btn + (cols - 1) * gap
+        grid_h = rows * btn + (rows - 1) * gap
+        knob_r = 40
+        knob_col_w = knob_r * 2 + 70
+        total_w = grid_w + 50 + knob_col_w
+        start_x = max(10, (w - total_w) // 2)
+        start_y = max(10, (h - grid_h) // 2)
+
+        buttons = []
+        for i in range(NUM_BUTTONS):
+            c = i % cols
+            r = i // cols
+            x1 = start_x + c * (btn + gap)
+            y1 = start_y + r * (btn + gap)
+            buttons.append((x1, y1, x1 + btn, y1 + btn))
+
+        knob_cx = start_x + grid_w + 50 + knob_r + 15
+        knobs = []
+        for k in range(NUM_KNOBS):
+            if NUM_KNOBS > 1:
+                cy = start_y + knob_r + k * ((grid_h - 2 * knob_r) / (NUM_KNOBS - 1))
+            else:
+                cy = start_y + grid_h / 2
+            knobs.append((knob_cx, cy, knob_r))
+        return buttons, knobs
+
     def draw_visualizer(self):
         if not self.running or not self.winfo_exists(): return
         self.canvas.delete("all")
         accent = "#888888"
         if self.current_preset_name in self.presets:
             accent = self.presets[self.current_preset_name].get("color", "#888888")
-        
-        w = self.canvas.winfo_width()
-        h = self.canvas.winfo_height()
-        if w < 10: return
-        
-        cx, cy = w // 2, h // 2
-        key_size = 80
-        gap = 30
-        
-        total_width = (3 * key_size) + (3 * gap) + 120
-        start_x = cx - (total_width / 2)
-        key_y = cy - (key_size // 2)
-        
-        for i in range(3):
-            x = start_x + (i * (key_size + gap))
+
+        if self.canvas.winfo_width() < 10: return
+        buttons, knobs = self._get_layout()
+
+        for i, (x1, y1, x2, y2) in enumerate(buttons):
             is_sel = (i == self.selected_key_index)
             fill = accent if is_sel else Theme.CONTAINER_BG
             outline = "#ffffff" if is_sel else "#333333"
             width = 3 if is_sel else 2
-            
-            tag = f"key_{i}"
-            self.create_rounded_rect(x, key_y, x+key_size, key_y+key_size, radius=15, fill=fill, outline=outline, width=width, tags=tag)
+            self.create_rounded_rect(x1, y1, x2, y2, radius=12, fill=fill, outline=outline, width=width)
             text_color = Theme.TEXT_INVERSE if (is_sel and not self.is_dark(accent)) else Theme.TEXT_PRIMARY
-            self.canvas.create_text(x + key_size/2, key_y + key_size/2, text=str(i+1), fill=text_color, font=("Segoe UI", 24, "bold"), tags=tag)
+            self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=str(i + 1), fill=text_color, font=("Segoe UI", 18, "bold"))
 
-        knob_x = start_x + (3 * (key_size + gap)) + 60
-        knob_y = cy
-        knob_r = 50
-        is_ccw = (self.selected_key_index == 3)
-        is_cw = (self.selected_key_index == 4)
-        is_press = (self.selected_key_index == 5)
-        
-        self.canvas.create_oval(knob_x-knob_r, knob_y-knob_r, knob_x+knob_r, knob_y+knob_r, fill=Theme.CONTAINER_BG, outline="#333333", width=2)
-        self.canvas.create_arc(knob_x-knob_r, knob_y-knob_r, knob_x+knob_r, knob_y+knob_r, start=90, extent=180, fill=accent if is_ccw else "#444444", style=tk.PIESLICE)
-        self.canvas.create_arc(knob_x-knob_r, knob_y-knob_r, knob_x+knob_r, knob_y+knob_r, start=270, extent=180, fill=accent if is_cw else "#444444", style=tk.PIESLICE)
-        self.canvas.create_oval(knob_x-25, knob_y-25, knob_x+25, knob_y+25, fill=Theme.CONTAINER_BG, outline="#222")
-        self.canvas.create_oval(knob_x-18, knob_y-18, knob_x+18, knob_y+18, fill=accent if is_press else "#222222", outline="white" if is_press else "#555")
-        self.canvas.create_text(knob_x-65, knob_y, text="CCW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 10, "bold"), anchor="e")
-        self.canvas.create_text(knob_x+65, knob_y, text="CW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 10, "bold"), anchor="w")
+        for k, (cx, cy, r) in enumerate(knobs):
+            base = NUM_BUTTONS + k * 3
+            is_ccw = (self.selected_key_index == base)
+            is_cw = (self.selected_key_index == base + 1)
+            is_press = (self.selected_key_index == base + 2)
+            ir = r * 0.5
+            pr = r * 0.36
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=Theme.CONTAINER_BG, outline="#333333", width=2)
+            self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=90, extent=180, fill=accent if is_ccw else "#444444", style=tk.PIESLICE)
+            self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=270, extent=180, fill=accent if is_cw else "#444444", style=tk.PIESLICE)
+            self.canvas.create_oval(cx-ir, cy-ir, cx+ir, cy+ir, fill=Theme.CONTAINER_BG, outline="#222")
+            self.canvas.create_oval(cx-pr, cy-pr, cx+pr, cy+pr, fill=accent if is_press else "#222222", outline="white" if is_press else "#555")
+            self.canvas.create_text(cx, cy-r-11, text=f"Knob {k+1}", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 10, "bold"))
+            self.canvas.create_text(cx-r-8, cy, text="CCW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 9, "bold"), anchor="e")
+            self.canvas.create_text(cx+r+8, cy, text="CW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 9, "bold"), anchor="w")
 
     def is_dark(self, hex_color):
         if not hex_color.startswith('#'): return True
@@ -1049,36 +1102,28 @@ class VMacroApp(ctk.CTk):
 
     def on_canvas_click(self, event):
         if self.is_uploading or not self.winfo_exists(): return
-        w = self.canvas.winfo_width()
-        h = self.canvas.winfo_height()
-        cx, cy = w // 2, h // 2
-        key_size = 80
-        gap = 30
-        
-        total_width = (3 * key_size) + (3 * gap) + 120
-        start_x = cx - (total_width / 2)
-        key_y = cy - (key_size // 2)
-        
-        for i in range(3):
-            kx = start_x + (i * (key_size + gap))
-            if kx <= event.x <= kx+key_size and key_y <= event.y <= key_y+key_size:
+        buttons, knobs = self._get_layout()
+
+        for i, (x1, y1, x2, y2) in enumerate(buttons):
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
                 self.selected_key_index = i
                 self.update_editor_ui()
                 self.draw_visualizer()
                 return
-        
-        knob_x = start_x + (3 * (key_size + gap)) + 60
-        knob_y = cy
-        dx = event.x - knob_x
-        dy = event.y - knob_y
-        dist = math.sqrt(dx*dx + dy*dy)
-        if dist <= 18:
-            self.selected_key_index = 5
-        elif dist <= 50:
-            self.selected_key_index = 3 if dx < 0 else 4
-        
-        self.update_editor_ui()
-        self.draw_visualizer()
+
+        for k, (cx, cy, r) in enumerate(knobs):
+            dx = event.x - cx
+            dy = event.y - cy
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist <= r:
+                base = NUM_BUTTONS + k * 3
+                if dist <= r * 0.36:
+                    self.selected_key_index = base + 2   # press
+                else:
+                    self.selected_key_index = base if dx < 0 else base + 1  # CCW / CW
+                self.update_editor_ui()
+                self.draw_visualizer()
+                return
 
     def update_editor_ui(self):
         if not self.running or not self.winfo_exists(): return
