@@ -1,7 +1,7 @@
 import customtkinter as ctk
 import tkinter as tk
 import tkinter.ttk as ttk
-from tkinter import messagebox, colorchooser
+from tkinter import messagebox, colorchooser, filedialog
 import hid
 import json
 import os
@@ -71,7 +71,27 @@ class Theme:
 DEFAULT_VENDOR_ID = 0x1189
 DEFAULT_PRODUCT_ID = 0x8890
 REPORT_ID = 0x03
-ACTION_IDS =[1, 2, 3, 13, 15, 14]
+
+# Physical layout of the 16-button / 3-knob macropad (VID 0x1189 / PID 0x8890).
+# 16 push buttons + 3 rotary encoders, each encoder contributing CCW / CW / press.
+NUM_BUTTONS = 16
+NUM_KNOBS = 3
+NUM_CONTROLS = NUM_BUTTONS + (NUM_KNOBS * 3)  # 25 mappable actions per layer
+
+# Firmware action ID for each UI control, in the same order as current_data:
+#   indices 0..15            -> buttons 1..16
+#   per knob k (base 16+k*3) -> [CCW, CW, Press]
+# The small 3-key/1-knob variant of this firmware family used [1,2,3, 13,15,14]
+# (keys from 1, then a consecutive CCW/Press/CW knob block). We generalise that:
+# buttons stay sequential from 1 and each knob occupies a consecutive triple
+# after the 16 button slots. The OUT config protocol for this larger device is
+# not captured/confirmed, so these IDs are a best-effort assumption and may need
+# adjustment once a USBPcap capture of the vendor tool decodes the real protocol.
+ACTION_IDS = list(range(1, NUM_BUTTONS + 1)) + [
+    17, 19, 18,   # Knob 1: CCW, CW, Press
+    20, 22, 21,   # Knob 2: CCW, CW, Press
+    23, 25, 24,   # Knob 3: CCW, CW, Press
+]
 
 # --- KEY MAPPINGS ---
 KEY_MAP = {
@@ -237,6 +257,40 @@ class MacroPadDevice:
 
     def set_led(self, mode): return self.write_data([0xB0, 0x08, mode])
 
+    # --- Diagnostics: raw writes with real return values ----------------------
+    def write_data_diag(self, payload, strategy="auto"):
+        """Send one report; return (ok, detail). Unlike write_data this does
+        not swallow the hidapi return code, so callers can see what happened."""
+        if not self.device:
+            return False, "no device connected"
+        buf = [REPORT_ID] + payload + [0] * (64 - len(payload))
+        if strategy == "output":
+            order = ["output"]
+        elif strategy == "feature":
+            order = ["feature"]
+        else:
+            order = ["output", "feature"]
+        notes = []
+        for mode in order:
+            try:
+                if mode == "output":
+                    res = self.device.write(buf)
+                else:
+                    res = self.device.send_feature_report(buf)
+                notes.append(f"{mode}={res}")
+                if res is not None and res >= 0:
+                    self.working_strategy = mode
+                    return True, f"OK via {mode} (bytes={res})"
+            except Exception as e:
+                notes.append(f"{mode}!ERR:{e}")
+        return False, "; ".join(notes)
+
+    def set_key_raw(self, action_id, mod, code, strategy="auto"):
+        """set_key against an explicit firmware action id (bypasses ACTION_IDS)."""
+        ok1, d1 = self.write_data_diag([action_id, 1, 1, 0, 0, 0], strategy)
+        ok2, d2 = self.write_data_diag([action_id, 1, 1, 1, mod, code], strategy)
+        return (ok1 and ok2), f"hdr[{d1}] data[{d2}]"
+
 
 # --- MAIN APPLICATION ---
 class VMacroApp(ctk.CTk):
@@ -248,10 +302,10 @@ class VMacroApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
         self.title(f"V Macropad Manager")
-        self.geometry("1000x700")
+        self.geometry("1080x860")
         self.configure(fg_color=Theme.MAIN_BG)
         self.protocol("WM_DELETE_WINDOW", self.on_close_attempt)
-        self.minsize(950, 650)
+        self.minsize(1000, 800)
         
         try:
             icon_path = self.resource_path("vmacropad.ico")
@@ -263,7 +317,7 @@ class VMacroApp(ctk.CTk):
         self.presets = self.load_presets()
         self.app_mappings = self.load_mappings()
         
-        self.current_data =[{"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0} for _ in range(6)]
+        self.current_data =[{"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0} for _ in range(NUM_CONTROLS)]
         self.led_mode = 1
         self.selected_key_index = 0
         self.current_preset_name = None
@@ -320,7 +374,8 @@ class VMacroApp(ctk.CTk):
         self.cfg_notify_preset = False
         self.cfg_notify_status = False
         self.cfg_tray_enabled = True
-        self.cfg_startup = True
+        self.cfg_startup = False
+        self.cfg_has_leds = False
         
         if os.path.exists(CONFIG_FILE):
             try:
@@ -332,7 +387,8 @@ class VMacroApp(ctk.CTk):
                     self.cfg_notify_preset = conf.get("notify_preset", False)
                     self.cfg_notify_status = conf.get("notify_status", False)
                     self.cfg_tray_enabled = conf.get("tray_enabled", True)
-                    self.cfg_startup = conf.get("startup_enabled", True)
+                    self.cfg_startup = conf.get("startup_enabled", False)
+                    self.cfg_has_leds = conf.get("has_leds", False)
             except: pass
 
     def load_config_state_ui_vars(self):
@@ -359,7 +415,8 @@ class VMacroApp(ctk.CTk):
                     "notify_preset": self.cfg_notify_preset,
                     "notify_status": self.cfg_notify_status,
                     "tray_enabled": self.cfg_tray_enabled,
-                    "startup_enabled": self.cfg_startup
+                    "startup_enabled": self.cfg_startup,
+                    "has_leds": self.cfg_has_leds
                 }, f, indent=4)
         except: pass
 
@@ -514,10 +571,146 @@ class VMacroApp(ctk.CTk):
         self.btn_del = ctk.CTkButton(btn_frame, text="DELETE", font=Theme.FONT_BODY, fg_color="#441111", hover_color="#802122", command=self.del_preset)
         self.btn_del.grid(row=0, column=1, padx=5, sticky="ew")
 
+        self.btn_import = ctk.CTkButton(btn_frame, text="IMPORT", font=Theme.FONT_BODY, fg_color=Theme.BUTTON_HOVER, hover_color=Theme.TEXT_DISABLED, command=self.import_preset_file)
+        self.btn_import.grid(row=1, column=0, padx=5, pady=(8,0), sticky="ew")
+
+        self.btn_export = ctk.CTkButton(btn_frame, text="EXPORT", font=Theme.FONT_BODY, fg_color=Theme.BUTTON_HOVER, hover_color=Theme.TEXT_DISABLED, command=self.export_preset_file)
+        self.btn_export.grid(row=1, column=1, padx=5, pady=(8,0), sticky="ew")
+
+        self.btn_diag = ctk.CTkButton(btn_frame, text="DIAGNOSTICS", font=Theme.FONT_BODY, fg_color="#1c2c44", hover_color="#27406b", command=self.open_diag_ui)
+        self.btn_diag.grid(row=2, column=0, columnspan=2, padx=5, pady=(8,0), sticky="ew")
+
         self.btn_settings = ctk.CTkButton(self.sidebar, text="SETTINGS", font=Theme.FONT_BODY, fg_color="transparent", border_width=1, border_color=Theme.TEXT_DISABLED, command=self.open_settings_ui)
         self.btn_settings.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 20))
         
         self.refresh_preset_list()
+
+    def _sweep_legend(self, start, end):
+        # Maps each firmware action id to a distinct, printable key:
+        #   ids 1..26 -> A..Z, ids 27..36 -> 1..9,0
+        legend = {}
+        for aid in range(start, end + 1):
+            if 1 <= aid <= 26:
+                name = chr(ord('A') + aid - 1)
+            elif 27 <= aid <= 36:
+                digit = aid - 26
+                name = "0" if digit == 10 else str(digit)
+            else:
+                continue
+            legend[aid] = (name, KEY_MAP.get(name, 0))
+        return legend
+
+    def open_diag_ui(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Diagnostics - Action ID Calibration")
+        win.geometry("640x640")
+        win.attributes("-topmost", True)
+        win.configure(fg_color=Theme.CONTAINER_BG)
+        try:
+            win.iconbitmap(self.resource_path("vmacropad.ico"))
+        except: pass
+
+        ctk.CTkLabel(win, text="DEVICE DIAGNOSTICS", font=Theme.FONT_HEADER).pack(pady=(15, 2))
+        ctk.CTkLabel(win, text="Reverse-engineer which firmware action ID drives which physical control.",
+                     text_color=Theme.TEXT_SECONDARY, font=("Segoe UI", 11)).pack()
+        ctk.CTkLabel(win, text="This OVERWRITES the device mapping. Re-upload a preset afterwards to restore.",
+                     text_color="#ffb74d", font=("Segoe UI", 11, "bold")).pack(pady=(2, 8))
+
+        ctrl = ctk.CTkFrame(win, fg_color="transparent")
+        ctrl.pack(fill="x", padx=20)
+        ctk.CTkLabel(ctrl, text="Write strategy:", text_color=Theme.TEXT_SECONDARY).grid(row=0, column=0, sticky="w", pady=4)
+        strat = ctk.CTkOptionMenu(ctrl, values=["auto", "output", "feature"], width=110)
+        strat.set("auto")
+        strat.grid(row=0, column=1, padx=8)
+        ctk.CTkLabel(ctrl, text="Action ID range:", text_color=Theme.TEXT_SECONDARY).grid(row=0, column=2, sticky="w", padx=(15, 0))
+        e_start = ctk.CTkEntry(ctrl, width=55); e_start.insert(0, "1")
+        e_start.grid(row=0, column=3, padx=4)
+        ctk.CTkLabel(ctrl, text="to").grid(row=0, column=4)
+        e_end = ctk.CTkEntry(ctrl, width=55); e_end.insert(0, "32")
+        e_end.grid(row=0, column=5, padx=4)
+
+        log_box = ctk.CTkTextbox(win, fg_color=Theme.MAIN_BG, font=("Consolas", 11), wrap="word")
+        log_box.pack(fill="both", expand=True, padx=20, pady=12)
+
+        def log(msg):
+            def _a():
+                if win.winfo_exists():
+                    log_box.insert("end", msg + "\n")
+                    log_box.see("end")
+            self.after(0, _a)
+
+        def run_sweep():
+            if not self.pad.is_connected():
+                log("ERROR: device not connected.")
+                return
+            try:
+                s = max(1, int(e_start.get())); en = min(60, int(e_end.get()))
+            except ValueError:
+                log("ERROR: range must be integers.")
+                return
+            strategy = strat.get()
+            legend = self._sweep_legend(s, en)
+
+            def worker():
+                with self.upload_lock:
+                    log(f"--- SWEEP ids {s}..{en}, strategy={strategy} ---")
+                    ok, d = self.pad.write_data_diag([0xA1, 0], strategy)
+                    log(f"select_layer(0): {d}")
+                    for aid in range(s, en + 1):
+                        if aid not in legend:
+                            continue
+                        name, code = legend[aid]
+                        ok, detail = self.pad.set_key_raw(aid, 0, code, strategy)
+                        log(f"  action {aid:>2} -> '{name}'   {'OK' if ok else 'FAIL'}  {detail}")
+                        time.sleep(0.02)
+                    ok, d = self.pad.write_data_diag([0xAA, 0xAA], strategy)
+                    log(f"save_to_flash: {d}")
+                    log("--- SWEEP DONE ---")
+                    log("Now open Notepad and press each physical button / turn+press")
+                    log("each knob. Note the letter produced, then map it back via")
+                    log("this legend:")
+                    log("  " + "  ".join(f"{a}='{n}'" for a, (n, _) in legend.items()))
+                    log("Tell Claude the 'physical control -> letter' list.")
+            threading.Thread(target=worker, daemon=True).start()
+
+        def single_write():
+            if not self.pad.is_connected():
+                log("ERROR: device not connected.")
+                return
+            try:
+                aid = int(e_single_id.get())
+            except ValueError:
+                log("ERROR: action id must be an integer.")
+                return
+            kname = cb_single_key.get()
+            code = KEY_MAP.get(kname, 0)
+            strategy = strat.get()
+
+            def worker():
+                with self.upload_lock:
+                    self.pad.write_data_diag([0xA1, 0], strategy)
+                    ok, detail = self.pad.set_key_raw(aid, 0, code, strategy)
+                    self.pad.write_data_diag([0xAA, 0xAA], strategy)
+                    log(f"single: action {aid} -> '{kname}'  {'OK' if ok else 'FAIL'}  {detail}")
+            threading.Thread(target=worker, daemon=True).start()
+
+        row2 = ctk.CTkFrame(win, fg_color="transparent")
+        row2.pack(fill="x", padx=20, pady=(0, 6))
+        ctk.CTkButton(row2, text="RUN CALIBRATION SWEEP", fg_color=Theme.ACTIVE_BUTTON,
+                      text_color="black", command=run_sweep).pack(side="left")
+        ctk.CTkLabel(row2, text="  Single write:", text_color=Theme.TEXT_SECONDARY).pack(side="left", padx=(15, 4))
+        e_single_id = ctk.CTkEntry(row2, width=55, placeholder_text="id"); e_single_id.pack(side="left", padx=4)
+        single_keys = [c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] + [str(d) for d in range(10)]
+        cb_single_key = ctk.CTkComboBox(row2, values=single_keys, state="readonly", width=70)
+        cb_single_key.set("Z")
+        cb_single_key.pack(side="left", padx=4)
+        ctk.CTkButton(row2, text="Send", width=60, command=single_write).pack(side="left", padx=4)
+
+        log("Ready. 'Run Calibration Sweep' assigns a unique letter to every")
+        log("action id, so one Notepad pass reveals the whole device map.")
+        log("If EVERY write says FAIL -> the report format/strategy is wrong")
+        log("(try output vs feature). If writes say OK but the pad types")
+        log("nothing -> firmware ignores this packet shape entirely.")
 
     def open_settings_ui(self):
         win = ctk.CTkToplevel(self)
@@ -545,6 +738,7 @@ class VMacroApp(ctk.CTk):
         var_notif_s = ctk.BooleanVar(value=self.cfg_notify_status)
         var_tray = ctk.BooleanVar(value=self.cfg_tray_enabled)
         var_start = ctk.BooleanVar(value=self.cfg_startup)
+        var_leds = ctk.BooleanVar(value=self.cfg_has_leds)
         
         frm_hw = ctk.CTkFrame(win, fg_color="transparent")
         frm_hw.pack(pady=10, padx=40, fill="x")
@@ -569,6 +763,7 @@ class VMacroApp(ctk.CTk):
                     if self.tray_icon: self.tray_icon.stop()
                     self.tray_icon = None
             self.cfg_startup = var_start.get()
+            self.cfg_has_leds = var_leds.get()
             self.toggle_startup()
             try:
                 new_vid = int(entry_vid.get(), 16)
@@ -590,6 +785,7 @@ class VMacroApp(ctk.CTk):
         ctk.CTkCheckBox(win, text="Notify on Connect/Disconnect", variable=var_notif_s).pack(pady=10, padx=40, anchor="w")
         ctk.CTkCheckBox(win, text="Enable System Tray Icon", variable=var_tray).pack(pady=10, padx=40, anchor="w")
         ctk.CTkCheckBox(win, text="Start with Windows", variable=var_start).pack(pady=10, padx=40, anchor="w")
+        ctk.CTkCheckBox(win, text="Device has LEDs", variable=var_leds).pack(pady=10, padx=40, anchor="w")
         
         ctk.CTkButton(win, text="SAVE & CLOSE", command=save_and_close, fg_color=Theme.ACTIVE_BUTTON, text_color="black").pack(pady=25)
         
@@ -630,7 +826,7 @@ class VMacroApp(ctk.CTk):
         self.vis_container = ctk.CTkFrame(self.main_frame, fg_color=Theme.WIDGET_BG, corner_radius=15)
         self.vis_container.grid(row=1, column=0, sticky="nsew", pady=10)
         
-        self.canvas = tk.Canvas(self.vis_container, bg=Theme.WIDGET_BG, highlightthickness=0, height=250)
+        self.canvas = tk.Canvas(self.vis_container, bg=Theme.WIDGET_BG, highlightthickness=0, height=360)
         self.canvas.pack(fill="both", expand=True, padx=20, pady=20)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Configure>", lambda e: self.draw_visualizer())
@@ -953,7 +1149,29 @@ class VMacroApp(ctk.CTk):
                 if "scroll" in new_d: new_d["mouse_scroll"] = new_d["scroll"]
 
             cleaned_data.append(new_d)
-            
+
+        def _blank():
+            return {"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0}
+
+        # Migrate presets saved by older builds onto the 25-control layout.
+        # The legacy 6-control layout was
+        #   [Key1, Key2, Key3, Knob CCW, Knob CW, Knob Press].
+        # In the new layout indices 3..5 are buttons 4..6, so naively padding
+        # would silently fire the old knob actions on physical buttons. Remap
+        # the knob triple onto knob 1's slots (NUM_BUTTONS..NUM_BUTTONS+2).
+        if len(cleaned_data) == 6:
+            migrated = [_blank() for _ in range(NUM_CONTROLS)]
+            for i in range(3):
+                migrated[i] = cleaned_data[i]            # Key1..3 -> Buttons 1..3
+            migrated[NUM_BUTTONS + 0] = cleaned_data[3]  # Knob CCW
+            migrated[NUM_BUTTONS + 1] = cleaned_data[4]  # Knob CW
+            migrated[NUM_BUTTONS + 2] = cleaned_data[5]  # Knob Press
+            cleaned_data = migrated
+        else:
+            while len(cleaned_data) < NUM_CONTROLS:
+                cleaned_data.append(_blank())
+            cleaned_data = cleaned_data[:NUM_CONTROLS]
+
         self.current_data = cleaned_data
         self.led_mode = data.get("led", 1)
         
@@ -993,51 +1211,77 @@ class VMacroApp(ctk.CTk):
         points =[x1+radius, y1, x1+radius, y1, x2-radius, y1, x2-radius, y1, x2, y1, x2, y1+radius, x2, y1+radius, x2, y2-radius, x2, y2-radius, x2, y2, x2-radius, y2, x2-radius, y2, x1+radius, y2, x1+radius, y2, x1, y2, x1, y2-radius, x1, y2-radius, x1, y1+radius, x1, y1+radius, x1, y1]
         return self.canvas.create_polygon(points, **kwargs, smooth=True)
 
+    def _get_layout(self):
+        # Single source of truth for control geometry, shared by the renderer
+        # and the click handler. Returns (buttons, knobs):
+        #   buttons -> list of (x1, y1, x2, y2) for control indices 0..NUM_BUTTONS-1
+        #   knobs   -> list of (cx, cy, r); knob k owns control indices
+        #              NUM_BUTTONS + k*3 .. +2  (CCW, CW, Press)
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        btn = 64
+        gap = 14
+        cols, rows = 4, 4
+        grid_w = cols * btn + (cols - 1) * gap
+        grid_h = rows * btn + (rows - 1) * gap
+        knob_r = 40
+        knob_col_w = knob_r * 2 + 70
+        total_w = grid_w + 50 + knob_col_w
+        start_x = max(10, (w - total_w) // 2)
+        start_y = max(10, (h - grid_h) // 2)
+
+        buttons = []
+        for i in range(NUM_BUTTONS):
+            c = i % cols
+            r = i // cols
+            x1 = start_x + c * (btn + gap)
+            y1 = start_y + r * (btn + gap)
+            buttons.append((x1, y1, x1 + btn, y1 + btn))
+
+        knob_cx = start_x + grid_w + 50 + knob_r + 15
+        knobs = []
+        for k in range(NUM_KNOBS):
+            if NUM_KNOBS > 1:
+                cy = start_y + knob_r + k * ((grid_h - 2 * knob_r) / (NUM_KNOBS - 1))
+            else:
+                cy = start_y + grid_h / 2
+            knobs.append((knob_cx, cy, knob_r))
+        return buttons, knobs
+
     def draw_visualizer(self):
         if not self.running or not self.winfo_exists(): return
         self.canvas.delete("all")
         accent = "#888888"
         if self.current_preset_name in self.presets:
             accent = self.presets[self.current_preset_name].get("color", "#888888")
-        
-        w = self.canvas.winfo_width()
-        h = self.canvas.winfo_height()
-        if w < 10: return
-        
-        cx, cy = w // 2, h // 2
-        key_size = 80
-        gap = 30
-        
-        total_width = (3 * key_size) + (3 * gap) + 120
-        start_x = cx - (total_width / 2)
-        key_y = cy - (key_size // 2)
-        
-        for i in range(3):
-            x = start_x + (i * (key_size + gap))
+
+        if self.canvas.winfo_width() < 10: return
+        buttons, knobs = self._get_layout()
+
+        for i, (x1, y1, x2, y2) in enumerate(buttons):
             is_sel = (i == self.selected_key_index)
             fill = accent if is_sel else Theme.CONTAINER_BG
             outline = "#ffffff" if is_sel else "#333333"
             width = 3 if is_sel else 2
-            
-            tag = f"key_{i}"
-            self.create_rounded_rect(x, key_y, x+key_size, key_y+key_size, radius=15, fill=fill, outline=outline, width=width, tags=tag)
+            self.create_rounded_rect(x1, y1, x2, y2, radius=12, fill=fill, outline=outline, width=width)
             text_color = Theme.TEXT_INVERSE if (is_sel and not self.is_dark(accent)) else Theme.TEXT_PRIMARY
-            self.canvas.create_text(x + key_size/2, key_y + key_size/2, text=str(i+1), fill=text_color, font=("Segoe UI", 24, "bold"), tags=tag)
+            self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=str(i + 1), fill=text_color, font=("Segoe UI", 18, "bold"))
 
-        knob_x = start_x + (3 * (key_size + gap)) + 60
-        knob_y = cy
-        knob_r = 50
-        is_ccw = (self.selected_key_index == 3)
-        is_cw = (self.selected_key_index == 4)
-        is_press = (self.selected_key_index == 5)
-        
-        self.canvas.create_oval(knob_x-knob_r, knob_y-knob_r, knob_x+knob_r, knob_y+knob_r, fill=Theme.CONTAINER_BG, outline="#333333", width=2)
-        self.canvas.create_arc(knob_x-knob_r, knob_y-knob_r, knob_x+knob_r, knob_y+knob_r, start=90, extent=180, fill=accent if is_ccw else "#444444", style=tk.PIESLICE)
-        self.canvas.create_arc(knob_x-knob_r, knob_y-knob_r, knob_x+knob_r, knob_y+knob_r, start=270, extent=180, fill=accent if is_cw else "#444444", style=tk.PIESLICE)
-        self.canvas.create_oval(knob_x-25, knob_y-25, knob_x+25, knob_y+25, fill=Theme.CONTAINER_BG, outline="#222")
-        self.canvas.create_oval(knob_x-18, knob_y-18, knob_x+18, knob_y+18, fill=accent if is_press else "#222222", outline="white" if is_press else "#555")
-        self.canvas.create_text(knob_x-65, knob_y, text="CCW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 10, "bold"), anchor="e")
-        self.canvas.create_text(knob_x+65, knob_y, text="CW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 10, "bold"), anchor="w")
+        for k, (cx, cy, r) in enumerate(knobs):
+            base = NUM_BUTTONS + k * 3
+            is_ccw = (self.selected_key_index == base)
+            is_cw = (self.selected_key_index == base + 1)
+            is_press = (self.selected_key_index == base + 2)
+            ir = r * 0.5
+            pr = r * 0.36
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, fill=Theme.CONTAINER_BG, outline="#333333", width=2)
+            self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=90, extent=180, fill=accent if is_ccw else "#444444", style=tk.PIESLICE)
+            self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r, start=270, extent=180, fill=accent if is_cw else "#444444", style=tk.PIESLICE)
+            self.canvas.create_oval(cx-ir, cy-ir, cx+ir, cy+ir, fill=Theme.CONTAINER_BG, outline="#222")
+            self.canvas.create_oval(cx-pr, cy-pr, cx+pr, cy+pr, fill=accent if is_press else "#222222", outline="white" if is_press else "#555")
+            self.canvas.create_text(cx, cy-r-11, text=f"Knob {k+1}", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 10, "bold"))
+            self.canvas.create_text(cx-r-8, cy, text="CCW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 9, "bold"), anchor="e")
+            self.canvas.create_text(cx+r+8, cy, text="CW", fill=Theme.TEXT_SECONDARY, font=("Segoe UI", 9, "bold"), anchor="w")
 
     def is_dark(self, hex_color):
         if not hex_color.startswith('#'): return True
@@ -1049,36 +1293,28 @@ class VMacroApp(ctk.CTk):
 
     def on_canvas_click(self, event):
         if self.is_uploading or not self.winfo_exists(): return
-        w = self.canvas.winfo_width()
-        h = self.canvas.winfo_height()
-        cx, cy = w // 2, h // 2
-        key_size = 80
-        gap = 30
-        
-        total_width = (3 * key_size) + (3 * gap) + 120
-        start_x = cx - (total_width / 2)
-        key_y = cy - (key_size // 2)
-        
-        for i in range(3):
-            kx = start_x + (i * (key_size + gap))
-            if kx <= event.x <= kx+key_size and key_y <= event.y <= key_y+key_size:
+        buttons, knobs = self._get_layout()
+
+        for i, (x1, y1, x2, y2) in enumerate(buttons):
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
                 self.selected_key_index = i
                 self.update_editor_ui()
                 self.draw_visualizer()
                 return
-        
-        knob_x = start_x + (3 * (key_size + gap)) + 60
-        knob_y = cy
-        dx = event.x - knob_x
-        dy = event.y - knob_y
-        dist = math.sqrt(dx*dx + dy*dy)
-        if dist <= 18:
-            self.selected_key_index = 5
-        elif dist <= 50:
-            self.selected_key_index = 3 if dx < 0 else 4
-        
-        self.update_editor_ui()
-        self.draw_visualizer()
+
+        for k, (cx, cy, r) in enumerate(knobs):
+            dx = event.x - cx
+            dy = event.y - cy
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist <= r:
+                base = NUM_BUTTONS + k * 3
+                if dist <= r * 0.36:
+                    self.selected_key_index = base + 2   # press
+                else:
+                    self.selected_key_index = base if dx < 0 else base + 1  # CCW / CW
+                self.update_editor_ui()
+                self.draw_visualizer()
+                return
 
     def update_editor_ui(self):
         if not self.running or not self.winfo_exists(): return
@@ -1175,6 +1411,175 @@ class VMacroApp(ctk.CTk):
             if self.presets:
                 self.load_preset_by_name(list(self.presets.keys())[0])
 
+    # --- Bulk import / export -------------------------------------------------
+    # Friendly preset file schema (JSON):
+    #   {
+    #     "name": "ETC EOS",
+    #     "color": "#2244aa",
+    #     "led": 0,
+    #     "controls": {
+    #       "button1":   {"key": "F1"},
+    #       "button2":   {"ctrl": true, "key": "Z"},
+    #       "button3":   {"media": "Vol Up"},
+    #       "button4":   {"mouse": "Left Click"},
+    #       "knob1_ccw": {"key": "Page Down"},
+    #       "knob1_cw":  {"key": "Page Up"},
+    #       "knob1_press": {"key": "Enter"}
+    #     }
+    #   }
+    # Control names: button1..button16 and knob{1..3}_{ccw|cw|press}.
+    # A spec may carry ctrl/shift/alt/win booleans plus one of key / media /
+    # mouse (+ optional scroll). Omitted controls default to unmapped.
+
+    def _control_name_to_index(self, raw):
+        n = str(raw).strip().lower().replace(" ", "").replace("-", "_")
+        if n.startswith("button"):
+            try:
+                b = int(n[6:])
+            except ValueError:
+                return None
+            if 1 <= b <= NUM_BUTTONS:
+                return b - 1
+            return None
+        m = re.match(r"knob([1-9]\d*)_(ccw|cw|press)", n)
+        if m:
+            k = int(m.group(1))
+            if 1 <= k <= NUM_KNOBS:
+                off = {"ccw": 0, "cw": 1, "press": 2}[m.group(2)]
+                return NUM_BUTTONS + (k - 1) * 3 + off
+        return None
+
+    def _index_to_control_name(self, idx):
+        if idx < NUM_BUTTONS:
+            return f"button{idx + 1}"
+        rel = idx - NUM_BUTTONS
+        k = rel // 3 + 1
+        part = ["ccw", "cw", "press"][rel % 3]
+        return f"knob{k}_{part}"
+
+    def _spec_to_control(self, spec):
+        spec = spec or {}
+        mod = (1 if spec.get("ctrl") else 0) | (2 if spec.get("shift") else 0) \
+            | (4 if spec.get("alt") else 0) | (8 if spec.get("win") else 0)
+
+        if "media" in spec and spec["media"]:
+            ci = {k.lower(): k for k in MEDIA_MAP}
+            b1, b2 = MEDIA_MAP.get(ci.get(str(spec["media"]).lower(), "None"), (0, 0))
+            return {"type": "media", "b1": b1, "b2": b2}
+
+        mb_name = spec.get("mouse")
+        sc_name = spec.get("scroll")
+        if (mb_name and str(mb_name).lower() != "none") or (sc_name and str(sc_name).lower() != "none"):
+            mbi = {k.lower(): k for k in MOUSE_BUTTONS}
+            sci = {k.lower(): k for k in MOUSE_WHEEL}
+            btn = MOUSE_BUTTONS.get(mbi.get(str(mb_name).lower(), "None"), 0)
+            scr = MOUSE_WHEEL.get(sci.get(str(sc_name).lower(), "None"), 0)
+            return {"type": "mouse", "mod": mod, "code": 0, "mouse_btn": btn, "mouse_scroll": scr}
+
+        ki = {k.lower(): k for k in KEY_MAP}
+        code = KEY_MAP.get(ki.get(str(spec.get("key", "None")).lower(), "None"), 0)
+        return {"type": "key", "mod": mod, "code": code, "mouse_btn": 0, "mouse_scroll": 0}
+
+    def _control_to_spec(self, d):
+        t = d.get("type", "key")
+        if t == "media":
+            name = next((k for k, v in MEDIA_MAP.items() if v == (d.get("b1", 0), d.get("b2", 0))), "None")
+            return None if name == "None" else {"media": name}
+
+        mod = d.get("mod", 0)
+        mods = {}
+        if mod & 1: mods["ctrl"] = True
+        if mod & 2: mods["shift"] = True
+        if mod & 4: mods["alt"] = True
+        if mod & 8: mods["win"] = True
+
+        if t == "mouse":
+            spec = dict(mods)
+            btn = next((k for k, v in MOUSE_BUTTONS.items() if v == d.get("mouse_btn", 0)), "None")
+            scr = next((k for k, v in MOUSE_WHEEL.items() if v == d.get("mouse_scroll", 0)), "None")
+            if btn != "None": spec["mouse"] = btn
+            if scr != "None": spec["scroll"] = scr
+            return spec or None
+
+        key = next((k for k, v in KEY_MAP.items() if v == d.get("code", 0)), "None")
+        if key == "None" and not mods:
+            return None
+        spec = dict(mods)
+        if key != "None": spec["key"] = key
+        return spec or None
+
+    def import_preset_file(self):
+        path = filedialog.askopenfilename(title="Import Preset", filetypes=[("Preset JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Import Failed", f"Could not read file:\n{e}")
+            return
+        if not isinstance(data, dict) or "controls" not in data:
+            messagebox.showerror("Import Failed", "File is not a valid preset (missing 'controls').")
+            return
+
+        keys = [{"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0} for _ in range(NUM_CONTROLS)]
+        mapped, unknown = 0, []
+        for cname, spec in data.get("controls", {}).items():
+            idx = self._control_name_to_index(cname)
+            if idx is None:
+                unknown.append(str(cname))
+                continue
+            keys[idx] = self._spec_to_control(spec)
+            mapped += 1
+
+        name = str(data.get("name") or os.path.splitext(os.path.basename(path))[0]).strip() or "Imported"
+        if name in self.presets and not messagebox.askyesno("Overwrite?", f"Preset '{name}' already exists. Overwrite it?"):
+            return
+
+        try:
+            led = int(data.get("led", 0))
+        except (TypeError, ValueError):
+            led = 0
+        self.presets[name] = {"keys": keys, "led": led, "color": data.get("color", "#888888")}
+        self.save_presets_file()
+        self.refresh_preset_list()
+        self.load_preset_by_name(name)
+
+        msg = f"Imported '{name}' — {mapped} control(s) mapped."
+        if unknown:
+            msg += f"\nIgnored unknown control name(s): {', '.join(unknown[:8])}"
+            if len(unknown) > 8:
+                msg += f" (+{len(unknown) - 8} more)"
+        messagebox.showinfo("Import Complete", msg)
+
+    def export_preset_file(self):
+        if not self.current_preset_name or self.current_preset_name not in self.presets:
+            messagebox.showerror("Export Failed", "No preset selected to export.")
+            return
+        path = filedialog.asksaveasfilename(title="Export Preset", defaultextension=".json",
+                                            initialfile=f"{self.current_preset_name}.json",
+                                            filetypes=[("Preset JSON", "*.json")])
+        if not path:
+            return
+        controls = {}
+        for i, d in enumerate(self.current_data):
+            spec = self._control_to_spec(d)
+            if spec is not None:
+                controls[self._index_to_control_name(i)] = spec
+        out = {
+            "name": self.current_preset_name,
+            "color": self.presets[self.current_preset_name].get("color", "#888888"),
+            "led": self.led_mode,
+            "controls": controls,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=4)
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+            return
+        messagebox.showinfo("Export Complete", f"Exported '{self.current_preset_name}' to:\n{path}")
+
     def start_upload(self):
         if self.is_uploading: return
         if self.pad.is_connected():
@@ -1195,7 +1600,8 @@ class VMacroApp(ctk.CTk):
                     elif t == "mouse": 
                         self.pad.set_mouse(i, d.get("mouse_btn", 0), d.get("mouse_scroll", 0), d.get("mod", 0))
                     time.sleep(0.02)
-                self.pad.set_led(self.led_mode)
+                if self.cfg_has_leds:
+                    self.pad.set_led(self.led_mode)
                 self.pad.save_to_flash()
             except Exception as e:
                 print(f"Upload Error: {e}")
@@ -1218,6 +1624,9 @@ class VMacroApp(ctk.CTk):
             self.btn_upload.configure(state=s, text="UPLOADING..." if b else "UPLOAD CONFIGURATION")
             self.btn_add.configure(state=s)
             self.btn_del.configure(state=s)
+            self.btn_import.configure(state=s)
+            self.btn_export.configure(state=s)
+            self.btn_diag.configure(state=s)
             for btn in self.preset_widgets.values(): btn.configure(state=s)
         except: pass
 

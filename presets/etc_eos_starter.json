@@ -1,0 +1,75 @@
+{
+    "_readme": [
+        "ETC Eos preset for the 16-button + 3-knob macropad (Eos Nomad on PC).",
+        "Import via the IMPORT button in the sidebar, then UPLOAD to the pad.",
+        "",
+        "Shortcuts taken from ETC's 'Eos Windows and macOS Keyboard Shortcuts'.",
+        "These are direct Eos keyboard shortcuts (no Scroll Lock required).",
+        "",
+        "Layout (the yellow 3-wide command block):",
+        "  knob presses (top row):  Part / Cue / Record",
+        "  button grid cols 1-3:    Eos rows 2-5 of the block",
+        "  button column 4:         Recall From / Copy To / Q Only / Thru",
+        "Buttons are row-major: row1=button1..4 ... row4=button13..16.",
+        "Knob ROTATION is intentionally unmapped (use the mouse wheel over an",
+        "encoder tile in Nomad to adjust parameters).",
+        "",
+        "'_suggested_layout' documents the Eos function + shortcut per control;",
+        "'controls' is the authoritative block that gets imported."
+    ],
+    "name": "ETC EOS",
+    "color": "#2a6bd4",
+    "led": 0,
+    "controls": {
+        "knob1_press": {"key": "P"},
+        "knob2_press": {"key": "Q"},
+        "knob3_press": {"key": "R"},
+
+        "button1":  {"alt": true, "key": "I"},
+        "button2":  {"alt": true, "key": "F"},
+        "button3":  {"ctrl": true, "key": "R"},
+        "button4":  {"key": "E"},
+
+        "button5":  {"alt": true, "key": "C"},
+        "button6":  {"alt": true, "key": "B"},
+        "button7":  {"key": "U"},
+        "button8":  {"key": "C"},
+
+        "button9":  {"alt": true, "key": "P"},
+        "button10": {"key": "S"},
+        "button11": {"key": "G"},
+        "button12": {"key": "X"},
+
+        "button13": {"shift": true, "key": "D"},
+        "button14": {"key": "D"},
+        "button15": {"key": "I"},
+        "button16": {"key": "T"}
+    },
+    "_suggested_layout": {
+        "knob1_press": {"eos": "Part",          "shortcut": "P"},
+        "knob2_press": {"eos": "Cue",           "shortcut": "Q"},
+        "knob3_press": {"eos": "Record",        "shortcut": "R"},
+
+        "button1":  {"eos": "Int Palette",    "shortcut": "Alt I"},
+        "button2":  {"eos": "Focus Palette",  "shortcut": "Alt F"},
+        "button3":  {"eos": "Record Only",    "shortcut": "Ctrl R"},
+        "button4":  {"eos": "Recall From",    "shortcut": "E"},
+
+        "button5":  {"eos": "Color Palette",  "shortcut": "Alt C"},
+        "button6":  {"eos": "Beam Palette",   "shortcut": "Alt B"},
+        "button7":  {"eos": "Update",         "shortcut": "U"},
+        "button8":  {"eos": "Copy To",        "shortcut": "C"},
+
+        "button9":  {"eos": "Preset",         "shortcut": "Alt P"},
+        "button10": {"eos": "Sub",            "shortcut": "S"},
+        "button11": {"eos": "Group",          "shortcut": "G"},
+        "button12": {"eos": "Q Only/Track",   "shortcut": "X"},
+
+        "button13": {"eos": "Follow/Hang",    "shortcut": "Shift D"},
+        "button14": {"eos": "Delay",          "shortcut": "D"},
+        "button15": {"eos": "Time",           "shortcut": "I"},
+        "button16": {"eos": "Thru",           "shortcut": "T"},
+
+        "knob_rotation": "unmapped - use mouse wheel over encoder tiles in Nomad"
+    }
+}
