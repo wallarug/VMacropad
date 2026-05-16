@@ -974,12 +974,27 @@ class VMacroApp(ctk.CTk):
 
             cleaned_data.append(new_d)
 
-        # Normalise to the current control count so presets saved by older
-        # builds (6 controls) still load on the 25-control layout. Extra slots
-        # default to an unmapped key; surplus slots are dropped.
-        while len(cleaned_data) < NUM_CONTROLS:
-            cleaned_data.append({"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0})
-        cleaned_data = cleaned_data[:NUM_CONTROLS]
+        def _blank():
+            return {"type": "key", "mod": 0, "code": 0, "mouse_btn": 0, "mouse_scroll": 0}
+
+        # Migrate presets saved by older builds onto the 25-control layout.
+        # The legacy 6-control layout was
+        #   [Key1, Key2, Key3, Knob CCW, Knob CW, Knob Press].
+        # In the new layout indices 3..5 are buttons 4..6, so naively padding
+        # would silently fire the old knob actions on physical buttons. Remap
+        # the knob triple onto knob 1's slots (NUM_BUTTONS..NUM_BUTTONS+2).
+        if len(cleaned_data) == 6:
+            migrated = [_blank() for _ in range(NUM_CONTROLS)]
+            for i in range(3):
+                migrated[i] = cleaned_data[i]            # Key1..3 -> Buttons 1..3
+            migrated[NUM_BUTTONS + 0] = cleaned_data[3]  # Knob CCW
+            migrated[NUM_BUTTONS + 1] = cleaned_data[4]  # Knob CW
+            migrated[NUM_BUTTONS + 2] = cleaned_data[5]  # Knob Press
+            cleaned_data = migrated
+        else:
+            while len(cleaned_data) < NUM_CONTROLS:
+                cleaned_data.append(_blank())
+            cleaned_data = cleaned_data[:NUM_CONTROLS]
 
         self.current_data = cleaned_data
         self.led_mode = data.get("led", 1)
